@@ -182,7 +182,7 @@ class EventList(list):
                     strings[k.name] = string_id
                     string_inserts.append((string_id, k.name))
                     kname = string_id
-                        string_id = string_id + 1
+                    string_id = string_id + 1
 
                 op_inserts.append((op_id, k.device, 0, k.interval.start * 1000, (k.interval.start + k.interval.elapsed_us()) * 1000, kname, empty))
                 api_ops_inserts.append((api_id, op_id))
