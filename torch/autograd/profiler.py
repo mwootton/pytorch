@@ -126,6 +126,81 @@ class EventList(list):
             use_cuda=self._use_cuda,
             profile_memory=self._profile_memory)
 
+    def export_rpd(self, path):
+        """Exports an EventList as an rpd database.
+
+         Arguments:
+            path (str): Path where the trace will be written.
+        """
+        print("Exporting rpt...")
+        import sqlite3
+
+        # FIXME: remove old file if it exists
+
+        connection = sqlite3.connect(path)
+        connection.execute('CREATE TABLE IF NOT EXISTS "rocpd_string" ("id" integer NOT NULL PRIMARY KEY, "string" varchar(4096) NOT NULL)')
+        connection.execute('CREATE TABLE IF NOT EXISTS "rocpd_op" ("id" integer NOT NULL PRIMARY KEY, "gpuId" integer NOT NULL, "queueId" integer NOT NULL, "sequenceId" integer NOT NULL, "completionSignal" varchar(18) NOT NULL, "start" integer NOT NULL, "end" integer NOT NULL, "description_id" integer NOT NULL REFERENCES "rocpd_string" ("id") DEFERRABLE INITIALLY DEFERRED, "opType_id" integer NOT NULL REFERENCES "rocpd_string" ("id") DEFERRABLE INITIALLY DEFERRED)')
+        connection.execute('CREATE TABLE IF NOT EXISTS "rocpd_api" ("id" integer NOT NULL PRIMARY KEY, "pid" integer NOT NULL, "tid" integer NOT NULL, "start" integer NOT NULL, "end" integer NOT NULL, "apiName_id" integer NOT NULL REFERENCES "rocpd_string" ("id") DEFERRABLE INITIALLY DEFERRED, "args_id" integer NOT NULL REFERENCES "rocpd_string" ("id") DEFERRABLE INITIALLY DEFERRED)')
+        connection.execute('CREATE TABLE IF NOT EXISTS "rocpd_api_ops" ("id" integer NOT NULL PRIMARY KEY AUTOINCREMENT, "api_id" integer NOT NULL REFERENCES "rocpd_api" ("id") DEFERRABLE INITIALLY DEFERRED, "op_id" integer NOT NULL REFERENCES "rocpd_op" ("id") DEFERRABLE INITIALLY DEFERRED)')
+
+        #Set up primary keys
+        string_id = 1
+        op_id = 1
+        api_id = 1
+
+        # Dicts
+        strings = {}    # string -> id
+
+        # rows to bulk insert
+        string_inserts = []
+        api_inserts = []
+        op_inserts = []
+        api_ops_inserts = []
+
+        #empty string
+        empty = string_id
+        strings[""] = string_id
+        string_inserts.append((string_id, ""))
+        string_id = string_id + 1
+
+        for evt in self:
+            try:
+                name = strings[evt.name]
+            except:
+                strings[evt.name] = string_id
+                string_inserts.append((string_id, evt.name))
+                name = string_id
+                string_id = string_id + 1
+
+            api_inserts.append((api_id, 100, evt.thread, evt.cpu_interval.start * 1000, (evt.cpu_interval.start + evt.cpu_interval.elapsed_us()) * 1000, name, empty))
+
+            #---------------------
+            for k in evt.kernels:
+                try:
+                    kname = strings[k.name]
+                except:
+                    strings[k.name] = string_id
+                    string_inserts.append((string_id, k.name))
+                    kname = string_id
+                        string_id = string_id + 1
+
+                op_inserts.append((op_id, k.device, 0, k.interval.start * 1000, (k.interval.start + k.interval.elapsed_us()) * 1000, kname, empty))
+                api_ops_inserts.append((api_id, op_id))
+                op_id = op_id + 1
+            #---------------------
+            api_id = api_id + 1
+
+        connection.executemany("insert into rocpd_string(id, string) values (?,?)", string_inserts)
+        connection.executemany("insert into rocpd_api(id, pid, tid, start, end, apiName_id, args_id) values (?,?,?,?,?,?,?)", api_inserts)
+        connection.executemany("insert into rocpd_op(id, gpuId, queueId, sequenceId, completionSignal,  start, end, description_id, opType_id) values (?,?,?,'','',?,?,?,?)", op_inserts)
+        connection.executemany("insert into rocpd_api_ops(api_id, op_id) values (?,?)", api_ops_inserts)
+        connection.execute("CREATE VIEW api AS SELECT rocpd_api.id,pid,tid,start,end,A.string AS apiName, B.string AS args FROM rocpd_api INNER JOIN rocpd_string A ON A.id = rocpd_api.apiName_id INNER JOIN rocpd_string B ON B.id = rocpd_api.args_id;");
+        connection.execute("CREATE VIEW op AS SELECT rocpd_op.id,gpuId,queueId,sequenceId,start,end,A.string AS description, B.string AS opType FROM rocpd_op INNER JOIN rocpd_string A ON A.id = rocpd_op.description_id INNER JOIN rocpd_string B ON B.id = rocpd_op.opType_id");
+        connection.execute("CREATE VIEW top AS SELECT A.string as KernelName, count(A.string) as TotalCalls, sum(rocpd_op.end-rocpd_op.start) / 1000 as TotalDuration, (sum(rocpd_op.end-rocpd_op.start)/count(A.string)) / 1000 as Ave, sum(rocpd_op.end-rocpd_op.start) * 100.0 / (select sum(end-start) from rocpd_op) as Percentage FROM rocpd_api_ops INNER JOIN rocpd_op ON rocpd_api_ops.op_id = rocpd_op.id INNER JOIN rocpd_string A ON A.id = rocpd_op.description_id group by KernelName order by TotalDuration desc");
+        connection.execute("CREATE VIEW busy AS select A.gpuId, GpuTime, WallTime, GpuTime*1.0/WallTime as Busy from (select gpuId, sum(end-start) as GpuTime from rocpd_op group by gpuId) A INNER JOIN (select max(end) - min(start) as WallTime from rocpd_op)");
+        connection.commit()
+        connection.close()
+
     def export_chrome_trace(self, path):
         """Exports an EventList as a Chrome tracing tools file.
 
@@ -351,6 +426,11 @@ class profile(object):
         return self.function_events.table(
             sort_by=sort_by, row_limit=row_limit, header=header)
     table.__doc__ = EventList.table.__doc__
+
+    def export_rpd(self, path):
+        self._check_finish()
+        return self.function_events.export_rpd(path)
+    export_rpd.__doc__ = EventList.export_rpd.__doc__
 
     def export_chrome_trace(self, path):
         self._check_finish()
@@ -925,11 +1005,12 @@ def parse_cpu_trace(thread_records):
                 if not is_async and start.has_cuda():
                     cuda_start = adjusted_time(start, cuda_records)
                     cuda_end = adjusted_time(record, cuda_records)
-                    fe.append_kernel(
-                        start.name(),
-                        start.device(),
-                        cuda_start,
-                        cuda_end)
+                    if (cuda_end - cuda_start) > 0:
+                        fe.append_kernel(
+                            start.name(),
+                            start.device(),
+                            cuda_start,
+                            cuda_end)
                 functions.append(fe)
                 del range_starts[record_key]
                 del cpu_memory_allocs[record_key]
