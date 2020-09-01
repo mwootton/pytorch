@@ -57,12 +57,13 @@ namespace {
 
 using stream_set = std::unordered_set<cuda::CUDAStream>;
 
-constexpr size_t kMinBlockSize = 512;       // all sizes are rounded to at least 512 bytes
-constexpr size_t kSmallSize = 1048576;      // largest "small" allocation is 1 MiB
-constexpr size_t kSmallBuffer = 2097152;    // "small" allocations are packed in 2 MiB blocks
-constexpr size_t kLargeBuffer = 20971520;   // "large" allocations may be packed in 20 MiB blocks
+constexpr size_t kMinBlockSize =       512;       // all sizes are rounded to at least 512 bytes
+constexpr size_t kSmallSize =      1048576;      // largest "small" allocation is 1 MiB
+constexpr size_t kSmallBuffer =    2097152;    // "small" allocations are packed in 2 MiB blocks
+constexpr size_t kLargeBuffer =   20971520;   // "large" allocations may be packed in 20 MiB blocks
 constexpr size_t kMinLargeAlloc = 10485760; // allocations between 1 and 10 MiB may use kLargeBuffer
-constexpr size_t kRoundLarge = 2097152;     // round up large allocs to 2 MiB
+constexpr size_t kRoundLarge =     2097152;     // round up large allocs to 2 MiB
+constexpr size_t kLargeSize = kLargeBuffer;    // largest "large" allocation is 20 MiB
 
 typedef std::bitset<static_cast<size_t>(StatType::NUM_TYPES)> StatTypes;
 
@@ -190,6 +191,9 @@ class DeviceCachingAllocator {
   // device statistics
   DeviceStats stats;
 
+  // unallocated cached blocks just plain large
+  BlockPool jumbo_blocks;
+
   // unallocated cached blocks larger than 1 MB
   BlockPool large_blocks;
 
@@ -205,6 +209,7 @@ class DeviceCachingAllocator {
  public:
 
   DeviceCachingAllocator() :
+      jumbo_blocks(BlockComparator),
       large_blocks(BlockComparator),
       small_blocks(BlockComparator) {}
 
@@ -225,6 +230,7 @@ class DeviceCachingAllocator {
     params.stat_types[static_cast<size_t>(StatType::AGGREGATE)] = true;
     params.stat_types[static_cast<size_t>(get_stat_type_for_pool(pool))] = true;
 
+    // FIXME if jumbo skip 1 and 2 below
     bool block_found =
       // Search pool
       get_free_block(params)
@@ -388,6 +394,7 @@ class DeviceCachingAllocator {
       cudaMemGetInfo(largest,  // Use free memory as an optimistic initial guess of *largest
                      &tmp_bytes);
     }
+    cache_info_aux(jumbo_blocks, total, largest);
     cache_info_aux(large_blocks, total, largest);
     cache_info_aux(small_blocks, total, largest);
   }
@@ -494,6 +501,7 @@ class DeviceCachingAllocator {
     std::vector<const Block*> blocks;
     blocks.insert(blocks.end(), small_blocks.begin(), small_blocks.end());
     blocks.insert(blocks.end(), large_blocks.begin(), large_blocks.end());
+    blocks.insert(blocks.end(), jumbo_blocks.begin(), jumbo_blocks.end());
     blocks.insert(blocks.end(), active_blocks.begin(), active_blocks.end());
     return blocks;
   }
@@ -518,12 +526,17 @@ class DeviceCachingAllocator {
       }
     }
 
+    // FIXME, dont insert jumbo into the pool
     active_blocks.erase(block);
     pool.insert(block);
 
     if (block->is_split()) {
       net_change_inactive_split_blocks += 1;
       net_change_inactive_split_size += block->size;
+    }
+
+    if (&pool == &jumbo_blocks) {
+      free_blocks(pool);
     }
 
     StatTypes stat_types;
@@ -568,8 +581,10 @@ class DeviceCachingAllocator {
   BlockPool& get_pool(size_t size) {
     if (size <= kSmallSize) {
       return small_blocks;
-    } else {
+    } else if (size <= kLargeSize) {
       return large_blocks;
+    } else {
+      return jumbo_blocks;
     }
   }
 
@@ -578,6 +593,8 @@ class DeviceCachingAllocator {
       return StatType::SMALL_POOL;
     } else if (&pool == &large_blocks) {
       return StatType::LARGE_POOL;
+    } else if (&pool == &jumbo_blocks) {
+      return StatType::JUMBO_POOL;
     } else {
       AT_ERROR("get_stat_type_for_pool: invalid pool");
     }
@@ -589,6 +606,8 @@ class DeviceCachingAllocator {
       return remaining >= kMinBlockSize;
     } else if (block->pool == &large_blocks) {
       return remaining > kSmallSize;
+    } else if (block->pool == &jumbo_blocks) {
+      return false;
     } else {
       AT_ERROR("should_split: invalid pool");
     }
@@ -652,6 +671,7 @@ class DeviceCachingAllocator {
     synchronize_and_free_events();
 
     // Free all non-split cached blocks
+    free_blocks(jumbo_blocks);
     free_blocks(large_blocks);
     free_blocks(small_blocks);
     return true;

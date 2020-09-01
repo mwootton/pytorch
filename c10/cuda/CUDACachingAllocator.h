@@ -55,7 +55,8 @@ enum struct StatType : uint64_t {
   AGGREGATE = 0,
   SMALL_POOL = 1,
   LARGE_POOL = 2,
-  NUM_TYPES = 3  // remember to update this whenever a new stat type is added
+  JUMBO_POOL = 3,
+  NUM_TYPES = 4  // remember to update this whenever a new stat type is added
 };
 
 typedef std::array<Stat, static_cast<size_t>(StatType::NUM_TYPES)> StatArray;
