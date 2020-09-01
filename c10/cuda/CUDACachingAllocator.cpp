@@ -206,12 +206,23 @@ class DeviceCachingAllocator {
   // outstanding cuda events
   std::deque<std::pair<cudaEvent_t, Block*>> cuda_events;
 
+  size_t largeSize;
+
  public:
 
   DeviceCachingAllocator() :
       jumbo_blocks(BlockComparator),
       large_blocks(BlockComparator),
-      small_blocks(BlockComparator) {}
+      small_blocks(BlockComparator),
+      largeSize(kLargeSize)
+  {
+     char *asize = getenv("CA_JUMBO_SIZE");
+     if (asize != NULL) {
+       largeSize = strtoul(asize, NULL, 0);
+       largeSize = (largeSize < kLargeSize) ? kLargeSize : largeSize;
+       printf("Using JumboSize: %lu\n", largeSize);
+     }
+  }
 
   // All public methods (except the above) acquire the allocator mutex.
   // Thus, do not call a public method from another public method.
@@ -581,7 +592,7 @@ class DeviceCachingAllocator {
   BlockPool& get_pool(size_t size) {
     if (size <= kSmallSize) {
       return small_blocks;
-    } else if (size <= kLargeSize) {
+    } else if (size <= largeSize) {
       return large_blocks;
     } else {
       return jumbo_blocks;
